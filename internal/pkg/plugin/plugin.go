@@ -37,7 +37,55 @@ import (
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
-// Plugin is identical to DevicePluginServer interface of device plugin API.
+// deviceSplitCountEnv is the name of the environment variable that controls
+// how many virtual devices each physical AMD GPU is advertised as.
+const deviceSplitCountEnv = "DEVICE_SPLIT_COUNT"
+
+// defaultDeviceSplitCount is used when deviceSplitCountEnv is unset or invalid.
+const defaultDeviceSplitCount = 100
+
+// DeviceSplitCount is the number of virtual devices each physical AMD GPU is
+// advertised as, so that multiple pods can share a single GPU. This follows the
+// same idea HAMI uses to slice NVIDIA GPUs: each physical device is reported to
+// kubelet as DeviceSplitCount independent devices with IDs of the form
+// "<realID>-<index>". It is resolved once at process start from the
+// DEVICE_SPLIT_COUNT environment variable (defaulting to 100).
+var DeviceSplitCount = loadDeviceSplitCount()
+
+// loadDeviceSplitCount resolves the shard count from the environment. Any
+// missing, non-numeric or non-positive value falls back to
+// defaultDeviceSplitCount so the plugin always publishes at least one device
+// per physical GPU.
+func loadDeviceSplitCount() int {
+	raw, ok := os.LookupEnv(deviceSplitCountEnv)
+	if !ok || raw == "" {
+		return defaultDeviceSplitCount
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		glog.Warningf("Invalid %s=%q, falling back to default %d", deviceSplitCountEnv, raw, defaultDeviceSplitCount)
+		return defaultDeviceSplitCount
+	}
+	return n
+}
+
+// realDeviceID extracts the physical GPU ID from a virtual (sharded) device ID.
+// Sharded IDs have the shape "<realID>-<index>" where <index> is a decimal
+// integer in [0, DeviceSplitCount). If the suffix is not numeric (e.g. it is
+// already a real device ID that happens to contain a '-'), the ID is returned
+// unchanged.
+func realDeviceID(id string) string {
+	idx := strings.LastIndex(id, "-")
+	if idx == -1 {
+		return id
+	}
+	if _, err := strconv.Atoi(id[idx+1:]); err != nil {
+		return id
+	}
+	return id[:idx]
+}
+
+// AMDGPUPlugin is identical to DevicePluginServer interface of device plugin API.
 type AMDGPUPlugin struct {
 	AMDGPUs            map[string]map[string]interface{}
 	Heartbeat          chan bool
@@ -208,7 +256,11 @@ func simpleHealthCheck() bool {
 // GetDevicePluginOptions returns options to be communicated with Device
 // Manager
 func (p *AMDGPUPlugin) GetDevicePluginOptions(ctx context.Context, e *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
-	if p.allocatorInitError {
+	// Topology-aware preferred allocation is keyed by physical GPU IDs, but
+	// with DeviceSplitCount > 1 kubelet only sees virtual shard IDs and the
+	// allocator can no longer match them. Disable the hook whenever sharding
+	// is enabled so kubelet falls back to its default allocation strategy.
+	if p.allocatorInitError || DeviceSplitCount > 1 {
 		return &pluginapi.DevicePluginOptions{}, nil
 	}
 	return &pluginapi.DevicePluginOptions{
@@ -230,9 +282,10 @@ func (p *AMDGPUPlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin
 
 	p.AMDGPUs = amdgpu.GetAMDGPUs()
 
-	glog.Infof("Found %d AMDGPUs", len(p.AMDGPUs))
+	glog.Infof("Found %d AMDGPUs, advertising %d virtual devices per GPU", len(p.AMDGPUs), DeviceSplitCount)
 
-	devs := make([]*pluginapi.Device, len(p.AMDGPUs))
+	// Each physical GPU is expanded into DeviceSplitCount virtual devices.
+	devs := make([]*pluginapi.Device, 0, len(p.AMDGPUs)*DeviceSplitCount)
 	var isHomogeneous bool
 	isHomogeneous = amdgpu.IsHomogeneous()
 	// Initialize a map to store partitionType based device list
@@ -241,17 +294,9 @@ func (p *AMDGPUPlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin
 	if isHomogeneous {
 		// limit scope for hwloc
 		func() {
-			i := 0
 			for id, device := range p.AMDGPUs {
-				dev := &pluginapi.Device{
-					ID:     id,
-					Health: pluginapi.Healthy,
-				}
-				devs[i] = dev
-				i++
-
 				numas := []int64{int64(device["numaNode"].(int))}
-				glog.Infof("Watching GPU with bus ID: %s NUMA Node: %+v", id, numas)
+				glog.Infof("Watching GPU with bus ID: %s NUMA Node: %+v (split into %d shards)", id, numas, DeviceSplitCount)
 
 				numaNodes := make([]*pluginapi.NUMANode, len(numas))
 				for j, v := range numas {
@@ -259,9 +304,14 @@ func (p *AMDGPUPlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin
 						ID: int64(v),
 					}
 				}
+				topology := &pluginapi.TopologyInfo{Nodes: numaNodes}
 
-				dev.Topology = &pluginapi.TopologyInfo{
-					Nodes: numaNodes,
+				for i := 0; i < DeviceSplitCount; i++ {
+					devs = append(devs, &pluginapi.Device{
+						ID:       fmt.Sprintf("%s-%d", id, i),
+						Health:   pluginapi.Healthy,
+						Topology: topology,
+					})
 				}
 			}
 		}()
@@ -269,16 +319,10 @@ func (p *AMDGPUPlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin
 	} else {
 		func() {
 			for id, device := range p.AMDGPUs {
-				dev := &pluginapi.Device{
-					ID:     id,
-					Health: pluginapi.Healthy,
-				}
-				// Append a device belonging to a certain partition type to its respective list
 				partitionType := device["computePartitionType"].(string) + "_" + device["memoryPartitionType"].(string)
-				resourceTypeDevs[partitionType] = append(resourceTypeDevs[partitionType], dev)
 
 				numas := []int64{int64(device["numaNode"].(int))}
-				glog.Infof("Watching GPU with bus ID: %s NUMA Node: %+v", id, numas)
+				glog.Infof("Watching GPU with bus ID: %s NUMA Node: %+v (split into %d shards)", id, numas, DeviceSplitCount)
 
 				numaNodes := make([]*pluginapi.NUMANode, len(numas))
 				for j, v := range numas {
@@ -286,9 +330,16 @@ func (p *AMDGPUPlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin
 						ID: int64(v),
 					}
 				}
+				topology := &pluginapi.TopologyInfo{Nodes: numaNodes}
 
-				dev.Topology = &pluginapi.TopologyInfo{
-					Nodes: numaNodes,
+				for i := 0; i < DeviceSplitCount; i++ {
+					dev := &pluginapi.Device{
+						ID:       fmt.Sprintf("%s-%d", id, i),
+						Health:   pluginapi.Healthy,
+						Topology: topology,
+					}
+					// Append a shard belonging to a certain partition type to its respective list
+					resourceTypeDevs[partitionType] = append(resourceTypeDevs[partitionType], dev)
 				}
 			}
 		}()
@@ -373,10 +424,20 @@ func (p *AMDGPUPlugin) Allocate(ctx context.Context, r *pluginapi.AllocateReques
 		dev.Permissions = "rw"
 		car.Devices = append(car.Devices, dev)
 
+		// Multiple virtual shards may resolve to the same physical GPU. Dedupe
+		// to avoid mounting the same /dev/dri/card* and /dev/dri/renderD* nodes
+		// more than once for the container.
+		allocated := make(map[string]bool)
 		for _, id := range req.DevicesIDs {
-			glog.Infof("Allocating device ID: %s", id)
+			realID := realDeviceID(id)
+			if allocated[realID] {
+				glog.Infof("Skipping duplicate shard %s for GPU %s", id, realID)
+				continue
+			}
+			allocated[realID] = true
+			glog.Infof("Allocating device ID: %s (shard %s)", realID, id)
 
-			for k, v := range p.AMDGPUs[id] {
+			for k, v := range p.AMDGPUs[realID] {
 				// Map struct previously only had 'card' and 'renderD' and only those are paths to be appended as before
 				if k != "card" && k != "renderD" {
 					continue
