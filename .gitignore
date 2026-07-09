@@ -46,3 +46,4 @@ dist/*
 
 # Local development environment overrides
 dev.env
+.idea/
