@@ -561,3 +561,50 @@ func GetCardProductName(cardName string) (string, error) {
 	productName := C.GoString(productNameStr)
 	return productName, nil
 }
+
+var topoSizeInBytesRe = regexp.MustCompile(`size_in_bytes\s(\d+)`)
+
+// CardPCIDeviceID returns the PCI device id for cardName (e.g. "card0"),
+// with any "0x" prefix stripped.
+func CardPCIDeviceID(cardName string) (string, error) {
+	devidPath := "/sys/class/drm/" + cardName + "/device/device"
+	b, err := os.ReadFile(devidPath)
+	if err != nil {
+		return "", err
+	}
+	devid := strings.TrimSpace(string(b))
+	if len(devid) >= 2 && (devid[0:2] == "0x" || devid[0:2] == "0X") {
+		devid = devid[2:]
+	}
+	return devid, nil
+}
+
+// CardVRAMBytes returns the discrete VRAM of the GPU associated with renderD
+// in bytes, read from KFD topology mem_banks. Returns 0 when the value cannot
+// be resolved.
+func CardVRAMBytes(renderD int) uint64 {
+	propertiesPath := "/sys/class/kfd/kfd/topology/nodes/*/properties"
+	files, err := filepath.Glob(propertiesPath)
+	if err != nil || len(files) == 0 {
+		return 0
+	}
+
+	for _, file := range files {
+		renderMinor, err := ParseTopologyProperties(file, topoDrmRenderMinorRe)
+		if err != nil || int(renderMinor) != renderD {
+			continue
+		}
+
+		parts := strings.Split(file, "/")
+		nodeNumber := parts[len(parts)-2]
+		vramTotalPath := fmt.Sprintf("/sys/class/kfd/kfd/topology/nodes/%s/mem_banks/0/properties", nodeNumber)
+
+		vSize, err := ParseTopologyProperties(vramTotalPath, topoSizeInBytesRe)
+		if err != nil {
+			return 0
+		}
+		return uint64(vSize)
+	}
+
+	return 0
+}
