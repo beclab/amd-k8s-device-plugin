@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -140,6 +141,7 @@ func main() {
 		// /sys/class/kfd only exists if ROCm kernel/driver is installed
 		var path = "/sys/class/kfd"
 		if _, err := os.Stat(path); err == nil {
+			go runNodeRegister(context.Background())
 			resources, err := getResourceList(strategy)
 			if err != nil {
 				glog.Errorf("Error occured: %v", err)
